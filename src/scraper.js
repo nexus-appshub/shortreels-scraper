@@ -13,64 +13,97 @@ export class ReelSession {
     this.scrollStep = scrollStep;
     this.scrollWait = scrollWait;
     this.maxItems = maxItems;
+
     this.browser = null;
+    this.context = null;
     this.page = null;
+
     this.items = new Map();
     this.networkCandidates = new Map();
+    this.resolvedPages = new Set();
+
     this.provider = providers.find(p => p.matches(url))?.name || 'generic';
     this.startedAt = Date.now();
     this.lastActivity = Date.now();
     this.revision = 0;
   }
 
-  async start() {
-    this.browser = await chromium.launch({ headless: this.headless });
-    const context = await this.browser.newContext({
-      viewport: { width: 390, height: 844 },
-      userAgent: 'ShortReelsScraper/0.2 (+public-media-resolver)'
-    });
-    this.page = await context.newPage();
+  attachNetworkCapture(page, sourceUrl) {
+    const capture = (url, contentType = '') => {
+      const type = mediaType(url, contentType);
+      if (!type || type === 'segment') return;
 
-    this.page.on('response', async response => {
+      const normalized = normalizeUrl(url, sourceUrl);
+      if (!normalized) return;
+
+      this.networkCandidates.set(normalized, {
+        url: normalized,
+        type,
+        contentType: contentType || null,
+        sourceUrl
+      });
+    };
+
+    page.on('response', response => {
       try {
-        const url = response.url();
-        const headers = response.headers();
-        const type = mediaType(url, headers['content-type'] || '');
-        if (!type || type === 'segment') return;
-        const normalized = normalizeUrl(url, this.url);
-        if (!normalized) return;
-        this.networkCandidates.set(normalized, {
-          url: normalized,
-          type,
-          contentType: headers['content-type'] || null
-        });
+        capture(response.url(), response.headers()['content-type'] || '');
       } catch {}
     });
 
-    this.page.on('request', request => {
-      const url = request.url();
-      const type = mediaType(url);
-      if (type && type !== 'segment') {
-        this.networkCandidates.set(url, { url, type, contentType: null });
-      }
+    page.on('request', request => {
+      try {
+        capture(request.url());
+      } catch {}
+    });
+  }
+
+  async start() {
+    this.browser = await chromium.launch({ headless: this.headless });
+
+    this.context = await this.browser.newContext({
+      viewport: { width: 390, height: 844 },
+      userAgent: 'ShortReelsScraper/0.3 (+public-media-resolver)'
     });
 
-    await this.page.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    this.page = await this.context.newPage();
+    this.attachNetworkCapture(this.page, this.url);
+
+    await this.page.goto(this.url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 45000
+    });
+
     await this.page.waitForTimeout(this.scrollWait);
+
     const newItems = await this.collect();
     return this.snapshot(50, newItems);
   }
 
   async collect() {
     this.lastActivity = Date.now();
+
     const before = new Set(this.items.keys());
     const provider = providers.find(p => p.name === this.provider) || genericProvider;
+
     const pageItems = await provider.extractPage(this.page).catch(() => []);
-    for (const item of pageItems) this.addItem(item, 'dom');
+
+    for (const item of pageItems) {
+      this.addItem(item, 'dom');
+    }
+
+    // GoodShort uses listing/drama/episode pages. Follow public page links
+    // and observe the media requests made by the normal web player.
+    if (this.provider === 'goodshort') {
+      await this.deepScrapeGoodShort(pageItems);
+    }
 
     for (const candidate of this.networkCandidates.values()) {
       this.addItem(
-        { sourceUrl: this.url, mediaUrl: candidate.url, title: null },
+        {
+          sourceUrl: candidate.sourceUrl || this.url,
+          mediaUrl: candidate.url,
+          title: null
+        },
         'network',
         candidate.type
       );
@@ -79,10 +112,203 @@ export class ReelSession {
     return Array.from(this.items.values()).filter(item => !before.has(item.id));
   }
 
+  async deepScrapeGoodShort(pageItems) {
+    const candidateUrls = [];
+    const seen = new Set();
+
+    for (const item of pageItems) {
+      const source = normalizeUrl(item.sourceUrl, this.page.url());
+      if (!source || seen.has(source)) continue;
+
+      // Public GoodShort drama/episode pages only. We do not bypass
+      // authentication, DRM, CAPTCHA, or other access controls.
+      if (!/goodshort\.com/i.test(new URL(source).hostname)) continue;
+      if (!/(\/drama\/|\/episode\/|\/episodes\/)/i.test(new URL(source).pathname)) continue;
+
+      seen.add(source);
+      candidateUrls.push(source);
+      if (candidateUrls.length >= 4) break;
+    }
+
+    for (const candidate of candidateUrls) {
+      if (this.resolvedPages.has(candidate)) continue;
+      this.resolvedPages.add(candidate);
+
+      const child = await this.context.newPage();
+      const localCandidates = new Map();
+
+      const capture = (url, contentType = '') => {
+        const type = mediaType(url, contentType);
+        if (!type || type === 'segment') return;
+
+        const normalized = normalizeUrl(url, candidate);
+        if (!normalized) return;
+
+        localCandidates.set(normalized, {
+          url: normalized,
+          type,
+          contentType: contentType || null,
+          sourceUrl: candidate
+        });
+      };
+
+      child.on('response', response => {
+        try {
+          capture(response.url(), response.headers()['content-type'] || '');
+        } catch {}
+      });
+
+      child.on('request', request => {
+        try {
+          capture(request.url());
+        } catch {}
+      });
+
+      try {
+        await child.goto(candidate, {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
+        });
+
+        await child.waitForTimeout(Math.max(1200, this.scrollWait));
+
+        // A normal player may only request its manifest after initialization.
+        // Calling play() is best-effort and does not bypass access controls.
+        await child.locator('video').first().evaluate(video => {
+          try {
+            video.muted = true;
+            const result = video.play();
+            if (result?.catch) result.catch(() => {});
+          } catch {}
+        }).catch(() => {});
+
+        await child.waitForTimeout(1800);
+
+        // If this is a drama/episodes index, collect its public episode links
+        // and resolve a small batch of them.
+        const links = await child.evaluate(() => {
+          const out = [];
+          const seen = new Set();
+
+          for (const a of document.querySelectorAll('a[href]')) {
+            const href = a.href;
+            if (!href || !/goodshort\.com/i.test(new URL(href).hostname)) continue;
+            if (!/(\/episode\/|\/episodes\/)/i.test(new URL(href).pathname)) continue;
+            if (seen.has(href)) continue;
+            seen.add(href);
+            out.push(href);
+            if (out.length >= 3) break;
+          }
+
+          return out;
+        }).catch(() => []);
+
+        for (const candidate of localCandidates.values()) {
+          this.networkCandidates.set(candidate.url, candidate);
+        }
+
+        for (const episodeUrl of links) {
+          if (this.resolvedPages.has(episodeUrl)) continue;
+          this.resolvedPages.add(episodeUrl);
+          await this.resolveGoodShortEpisode(episodeUrl);
+        }
+      } catch {
+        // Individual pages can fail without killing the feed session.
+      } finally {
+        await child.close().catch(() => {});
+      }
+    }
+  }
+
+  async resolveGoodShortEpisode(episodeUrl) {
+    const child = await this.context.newPage();
+    const localCandidates = new Map();
+
+    const capture = (url, contentType = '') => {
+      const type = mediaType(url, contentType);
+      if (!type || type === 'segment') return;
+
+      const normalized = normalizeUrl(url, episodeUrl);
+      if (!normalized) return;
+
+      localCandidates.set(normalized, {
+        url: normalized,
+        type,
+        contentType: contentType || null,
+        sourceUrl: episodeUrl
+      });
+    };
+
+    child.on('response', response => {
+      try {
+        capture(response.url(), response.headers()['content-type'] || '');
+      } catch {}
+    });
+
+    child.on('request', request => {
+      try {
+        capture(request.url());
+      } catch {}
+    });
+
+    try {
+      await child.goto(episodeUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000
+      });
+
+      await child.waitForTimeout(Math.max(1500, this.scrollWait));
+
+      await child.locator('video').first().evaluate(video => {
+        try {
+          video.muted = true;
+          const result = video.play();
+          if (result?.catch) result.catch(() => {});
+        } catch {}
+      }).catch(() => {});
+
+      await child.waitForTimeout(2200);
+
+      // Also inspect the rendered video element in case the player exposes
+      // a direct MP4/WebM source rather than HLS/DASH.
+      const directMedia = await child.locator('video').evaluateAll(videos =>
+        videos.map(v => ({
+          mediaUrl: v.currentSrc || v.src || null,
+          thumbnailUrl: v.poster || null
+        })).filter(v => v.mediaUrl)
+      ).catch(() => []);
+
+      for (const media of directMedia) {
+        capture(media.mediaUrl);
+        this.addItem({
+          sourceUrl: episodeUrl,
+          mediaUrl: media.mediaUrl,
+          thumbnailUrl: media.thumbnailUrl,
+          title: null
+        }, 'episode-dom');
+      }
+
+      for (const candidate of localCandidates.values()) {
+        this.networkCandidates.set(candidate.url, candidate);
+        this.addItem({
+          sourceUrl: episodeUrl,
+          mediaUrl: candidate.url,
+          title: null
+        }, 'episode-network', candidate.type);
+      }
+    } catch {
+      // Keep the main feed alive when an individual episode cannot be opened.
+    } finally {
+      await child.close().catch(() => {});
+    }
+  }
+
   addItem(item, discoveredBy = 'dom', forcedType = null) {
     if (!item) return false;
+
     const mediaUrl = normalizeUrl(item.mediaUrl, item.sourceUrl || this.url);
     if (!mediaUrl) return false;
+
     const type = forcedType || mediaType(mediaUrl);
     if (!type || type === 'segment') return false;
 
@@ -93,6 +319,7 @@ export class ReelSession {
     ]);
 
     const existing = this.items.get(id);
+
     const candidate = {
       id,
       sourceUrl: normalizeUrl(item.sourceUrl || this.url, this.url),
@@ -108,9 +335,11 @@ export class ReelSession {
     if (!existing) {
       this.items.set(id, candidate);
       this.revision++;
+
       if (this.items.size > this.maxItems) {
         this.items.delete(this.items.keys().next().value);
       }
+
       return true;
     }
 
@@ -119,15 +348,19 @@ export class ReelSession {
     existing.type = better.type;
     existing.title ||= candidate.title;
     existing.thumbnailUrl ||= candidate.thumbnailUrl;
+
     return false;
   }
 
   async advance() {
     if (!this.page) await this.start();
+
     await this.page.evaluate(step => {
       window.scrollBy({ top: step, behavior: 'instant' });
     }, this.scrollStep);
+
     await this.page.waitForTimeout(this.scrollWait);
+
     const newItems = await this.collect();
     return this.snapshot(50, newItems);
   }
@@ -147,6 +380,7 @@ export class ReelSession {
   async close() {
     await this.browser?.close().catch(() => {});
     this.browser = null;
+    this.context = null;
     this.page = null;
   }
 }
