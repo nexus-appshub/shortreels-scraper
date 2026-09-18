@@ -18,11 +18,20 @@ const SCROLL_WAIT_MS = Number(process.env.SCROLL_WAIT_MS || 900);
 const MAX_REELS_PER_SESSION = Number(process.env.MAX_REELS_PER_SESSION || 500);
 
 const DEMO_SOURCES = [
-  { name: 'GoodShort', url: 'https://www.goodshort.com/', feedUrl: '/v1/feed?url=https%3A%2F%2Fwww.goodshort.com%2F&limit=10' },
-  { name: 'DashReels', url: 'https://dashreels.com/', feedUrl: '/v1/feed?url=https%3A%2F%2Fdashreels.com%2F&limit=10' }
+  {
+    name: 'GoodShort',
+    url: 'https://www.goodshort.com/dramas/playlets?openCategory=1',
+    feedUrl: '/v1/feed?url=https%3A%2F%2Fwww.goodshort.com%2Fdramas%2Fplaylets%3FopenCategory%3D1&limit=10'
+  },
+  {
+    name: 'DashReels',
+    url: 'https://dashreels.com/',
+    feedUrl: '/v1/feed?url=https%3A%2F%2Fdashreels.com%2F&limit=10'
+  }
 ];
 
 const safeLimit = value => Math.min(50, Math.max(1, Number(value) || 10));
+
 const sourceKey = value => {
   try {
     return new URL(value).href;
@@ -34,10 +43,13 @@ const sourceKey = value => {
 async function destroySession(id) {
   const session = sessions.get(id);
   if (!session) return false;
+
   sessions.delete(id);
+
   for (const [key, value] of sourceSessions) {
     if (value === id) sourceSessions.delete(key);
   }
+
   await session.close();
   return true;
 }
@@ -57,6 +69,7 @@ app.get('/', async () => ({
 
 app.get('/demo-sources', async (req) => {
   const base = `${req.protocol}://${req.hostname}`;
+
   return {
     success: true,
     sources: DEMO_SOURCES.map(source => ({
@@ -75,7 +88,11 @@ app.get('/health', async () => ({
 app.post('/v1/reset-sessions', async () => {
   const ids = [...sessions.keys()];
   for (const id of ids) await destroySession(id);
-  return { success: true, closed: ids.length };
+
+  return {
+    success: true,
+    closed: ids.length
+  };
 });
 
 app.get('/v1/feed', async (req, reply) => {
@@ -84,12 +101,20 @@ app.get('/v1/feed', async (req, reply) => {
 
   // Explicit sessionId always wins: this is the continuous-scroll path.
   let session = sessionId ? sessions.get(sessionId) : null;
+
   if (session) {
     try {
       const next = await session.advance();
-      return { success: true, sessionId, ...next, items: next.items.slice(-safe) };
+
+      return {
+        success: true,
+        sessionId,
+        ...next,
+        items: next.items.slice(-safe)
+      };
     } catch (error) {
       await destroySession(sessionId);
+
       return reply.code(502).send({
         success: false,
         sessionId,
@@ -107,17 +132,23 @@ app.get('/v1/feed', async (req, reply) => {
   }
 
   const key = sourceKey(url);
+
   if (!key) {
-    return reply.code(400).send({ success: false, error: 'invalid source url' });
+    return reply.code(400).send({
+      success: false,
+      error: 'invalid source url'
+    });
   }
 
-  // Prevent browser refreshes / duplicate initial requests from creating
-  // multiple Chromium sessions for the same source.
+  // Prevent refreshes/duplicate initial requests from creating multiple
+  // Chromium sessions for the same source.
   if (newSession !== 'true') {
     const existingId = sourceSessions.get(key);
     const existing = existingId ? sessions.get(existingId) : null;
+
     if (existing) {
       existing.lastActivity = Date.now();
+
       return {
         success: true,
         sessionId: existingId,
@@ -144,11 +175,13 @@ app.get('/v1/feed', async (req, reply) => {
   });
 
   const id = crypto.randomUUID();
+
   sessions.set(id, session);
   sourceSessions.set(key, id);
 
   try {
     const first = await session.start();
+
     return {
       success: true,
       sessionId: id,
@@ -157,6 +190,7 @@ app.get('/v1/feed', async (req, reply) => {
     };
   } catch (error) {
     await destroySession(id);
+
     return reply.code(502).send({
       success: false,
       error: 'failed to open source page',
@@ -167,11 +201,16 @@ app.get('/v1/feed', async (req, reply) => {
 
 app.delete('/v1/feed/:sessionId', async (req) => {
   const closed = await destroySession(req.params.sessionId);
-  return { success: true, closed };
+
+  return {
+    success: true,
+    closed
+  };
 });
 
 setInterval(async () => {
   const now = Date.now();
+
   for (const [id, session] of sessions) {
     if (now - session.lastActivity > SESSION_TTL_MS) {
       await destroySession(id);
@@ -179,4 +218,7 @@ setInterval(async () => {
   }
 }, 60000).unref();
 
-await app.listen({ port: PORT, host: HOST });
+await app.listen({
+  port: PORT,
+  host: HOST
+});
