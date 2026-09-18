@@ -15,6 +15,24 @@ const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || 1100);
 const SCROLL_WAIT_MS = Number(process.env.SCROLL_WAIT_MS || 900);
 const MAX_REELS_PER_SESSION = Number(process.env.MAX_REELS_PER_SESSION || 500);
 
+const DEMO_SOURCES = [
+  { name: 'GoodShort', url: 'https://www.goodshort.com/', feedUrl: '/v1/feed?url=https%3A%2F%2Fwww.goodshort.com%2F&limit=10' },
+  { name: 'DashReels', url: 'https://dashreels.com/', feedUrl: '/v1/feed?url=https%3A%2F%2Fdashreels.com%2F&limit=10' }
+];
+
+app.get('/', async () => ({
+  ok: true,
+  service: 'shortreels-scraper',
+  status: 'online',
+  endpoints: { health: '/health', feed: '/v1/feed?url=SOURCE_URL&limit=10', demoSources: '/demo-sources' },
+  note: 'Use /demo-sources for verified public source URLs.'
+}));
+
+app.get('/demo-sources', async (req) => {
+  const base = `${req.protocol}://${req.hostname}`;
+  return { success: true, sources: DEMO_SOURCES.map(source => ({ ...source, testUrl: `${base}${source.feedUrl}` })) };
+});
+
 app.get('/health', async () => ({ ok: true, service: 'shortreels-scraper', sessions: sessions.size }));
 
 app.get('/v1/feed', async (req, reply) => {
@@ -28,7 +46,8 @@ app.get('/v1/feed', async (req, reply) => {
     sessions.set(id, session);
     try {
       const first = await session.start();
-      return { success: true, sessionId: id, ...first, items: first.items.slice(-Number(limit)) };
+      const safeLimit = Math.min(50, Math.max(1, Number(limit) || 10));
+      return { success: true, sessionId: id, ...first, items: first.items.slice(-safeLimit) };
     } catch (error) {
       sessions.delete(id);
       await session.close();
@@ -37,7 +56,8 @@ app.get('/v1/feed', async (req, reply) => {
   }
   try {
     const next = await session.advance();
-    return { success: true, sessionId, ...next, items: next.items.slice(-Number(limit)) };
+    const safeLimit = Math.min(50, Math.max(1, Number(limit) || 10));
+    return { success: true, sessionId, ...next, items: next.items.slice(-safeLimit) };
   } catch (error) {
     return reply.code(502).send({ success: false, sessionId, error: 'feed advance failed', detail: error.message });
   }
