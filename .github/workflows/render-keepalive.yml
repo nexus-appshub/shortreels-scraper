@@ -1,0 +1,16 @@
+name: Keep Render API Awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render health endpoint
+        run: |
+          set -e
+          curl --fail --silent --show-error --max-time 60             https://shortreels-scraper-1.onrender.com/health
+          echo
