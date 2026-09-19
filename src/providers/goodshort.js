@@ -8,7 +8,7 @@ export const goodShortProvider = {
   name: 'goodshort',
 
   matches(url) {
-    return /(^|\\.)goodshort\\.com$/i.test(new URL(url).hostname);
+    return /(^|\.)goodshort\.com$/i.test(new URL(url).hostname);
   },
 
   async extractPage(page) {
@@ -120,7 +120,7 @@ export const goodShortProvider = {
         } catch {}
 
         const matches = text.match(
-          /https?:\\/\\/[^\\s"'\\\\<>]+(?:\\.m3u8|\\.mpd|\\.mp4|\\.webm)(?:\\?[^\\s"'\\\\<>]*)?/gi
+          /https?:\/\/[^\s"'\\<>]+(?:\.m3u8|\.mpd|\.mp4|\.webm)(?:\?[^\s"'\\<>]*)?/gi
         ) || [];
 
         for (const raw of matches) {
