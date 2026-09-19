@@ -11,11 +11,11 @@ const sourceSessions = new Map();
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const HEADLESS = String(process.env.HEADLESS || 'true') !== 'false';
-const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 2);
+const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 4);
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 900000);
 const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || 1100);
 const SCROLL_WAIT_MS = Number(process.env.SCROLL_WAIT_MS || 900);
-const MAX_REELS_PER_SESSION = Number(process.env.MAX_REELS_PER_SESSION || 500);
+const MAX_REELS_PER_SESSION = Number(process.env.MAX_REELS_PER_SESSION || 500);\n\nasync function cleanupExpiredSessions() {\n  const now = Date.now();\n  for (const [id, session] of sessions) {\n    if (now - session.lastActivity > SESSION_TTL_MS) await destroySession(id);\n  }\n}
 
 const DEMO_SOURCES = [
   {
@@ -158,7 +158,7 @@ app.get('/v1/feed', async (req, reply) => {
     }
   }
 
-  if (sessions.size >= MAX_SESSIONS) {
+  await cleanupExpiredSessions();\n\n  if (sessions.size >= MAX_SESSIONS) {
     return reply.code(429).send({
       success: false,
       error: 'session capacity reached',
