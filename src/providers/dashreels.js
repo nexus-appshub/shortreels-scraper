@@ -2,7 +2,7 @@ export const dashReelsProvider = {
   name: 'dashreels',
 
   matches(url) {
-    return /dashreels/i.test(new URL(url).hostname) || /dashtoon\\.ai/i.test(new URL(url).hostname);
+    return /dashreels/i.test(new URL(url).hostname) || /dashtoon\.ai/i.test(new URL(url).hostname);
   },
 
   async extractPage(page) {
@@ -61,8 +61,8 @@ export const dashReelsProvider = {
           walk(JSON.parse(text));
         } catch {
           // Some SPA bundles contain escaped media URLs rather than JSON.
-          const matches = text.match(/https?:\\/\\/[^"'\\\\\\s]+(?:\\.m3u8|\\.mpd|\\.mp4)(?:\\?[^"'\\\\\\s]*)?/gi) || [];
-          for (const url of matches) add({ mediaUrl: url.replace(/\\\\/g, '') });
+          const matches = text.match(/https?:\/\/[^"'\\\\\\s]+(?:\.m3u8|\.mpd|\.mp4)(?:\\?[^"'\\\\\\s]*)?/gi) || [];
+          for (const url of matches) add({ mediaUrl: url.replace(/\\/g, '') });
         }
       }
 
