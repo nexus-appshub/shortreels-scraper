@@ -61,7 +61,7 @@ export const dashReelsProvider = {
           walk(JSON.parse(text));
         } catch {
           // Some SPA bundles contain escaped media URLs rather than JSON.
-          const matches = text.match(/https?:\/\/[^"'\\\\\\s]+(?:\.m3u8|\.mpd|\.mp4)(?:\\?[^"'\\\\\\s]*)?/gi) || [];
+          const matches = text.match(/https?:\/\/[^\s"'\\]+(?:\.m3u8|\.mpd|\.mp4)(?:\?[^\s"'\\]+)?/gi) || [];
           for (const url of matches) add({ mediaUrl: url.replace(/\\/g, '') });
         }
       }
