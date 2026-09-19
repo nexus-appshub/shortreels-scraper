@@ -44,9 +44,23 @@ export class ReelSession {
       });
     };
 
-    page.on('response', response => {
+    page.on('response', async response => {
       try {
-        capture(response.url(), response.headers()['content-type'] || '');
+        const contentType = response.headers()['content-type'] || '';
+        capture(response.url(), contentType);
+
+        // DashReels commonly exposes the playable URL through JSON API
+        // responses. Inspect JSON bodies as well as the actual media request.
+        if (/json|javascript|text/i.test(contentType) && /dashreels|dashtoon/i.test(response.url())) {
+          const body = await response.text().catch(() => '');
+          if (body) {
+            const urls = body.match(/https?:\\/\\/[^"'\\\\\\s]+/gi) || [];
+            for (const raw of urls) {
+              const candidate = raw.replace(/\\\\/g, '');
+              capture(candidate);
+            }
+          }
+        }
       } catch {}
     });
 
@@ -97,6 +111,13 @@ export class ReelSession {
       await this.deepScrapeGoodShort(pageItems);
     }
 
+    // DashReels is a SPA: the feed API can contain the video metadata while
+    // the player may not request media until a video is initialized. Trigger
+    // normal browser playback and inspect public show/episode pages.
+    if (this.provider === 'dashreels') {
+      await this.deepScrapeDashReels(pageItems);
+    }
+
     for (const candidate of this.networkCandidates.values()) {
       this.addItem(
         {
@@ -110,6 +131,144 @@ export class ReelSession {
     }
 
     return Array.from(this.items.values()).filter(item => !before.has(item.id));
+  }
+
+  async deepScrapeDashReels(pageItems) {
+    const candidateUrls = [];
+    const seen = new Set();
+
+    const addUrl = value => {
+      if (!value) return;
+      try {
+        const u = new URL(value, this.page.url());
+        if (!/dashreels|dashtoon/i.test(u.hostname)) return;
+        if (!/(show|reel|episode|drama|watch|video)/i.test(u.pathname)) return;
+        const href = u.href;
+        if (seen.has(href)) return;
+        seen.add(href);
+        candidateUrls.push(href);
+      } catch {}
+    };
+
+    for (const item of pageItems) addUrl(item.sourceUrl);
+
+    const domLinks = await this.page.evaluate(() =>
+      Array.from(document.querySelectorAll('a[href]'))
+        .map(a => a.href)
+        .filter(Boolean)
+        .slice(0, 200)
+    ).catch(() => []);
+
+    domLinks.forEach(addUrl);
+
+    // Initialize any visible HTML5 video elements without bypassing login,
+    // subscription, DRM, CAPTCHA, or other access controls.
+    await this.page.locator('video').evaluateAll(videos => {
+      for (const video of videos) {
+        try {
+          video.muted = true;
+          const p = video.play();
+          if (p?.catch) p.catch(() => {});
+        } catch {}
+      }
+    }).catch(() => {});
+
+    // Some players use a visible play button before the media request starts.
+    await this.page.locator('button, [role="button"]').evaluateAll(nodes => {
+      for (const node of nodes.slice(0, 30)) {
+        const label = (node.getAttribute('aria-label') || node.textContent || '').trim();
+        if (/^(play|watch|continue)$/i.test(label)) {
+          try { node.click(); } catch {}
+        }
+      }
+    }).catch(() => {});
+
+    await this.page.waitForTimeout(Math.max(1800, this.scrollWait));
+
+    for (const candidate of candidateUrls.slice(0, 6)) {
+      if (this.resolvedPages.has(candidate)) continue;
+      this.resolvedPages.add(candidate);
+
+      const child = await this.context.newPage();
+      const localCandidates = new Map();
+
+      const capture = (url, contentType = '') => {
+        const type = mediaType(url, contentType);
+        if (!type || type === 'segment') return;
+        const normalized = normalizeUrl(url, candidate);
+        if (!normalized) return;
+        localCandidates.set(normalized, {
+          url: normalized,
+          type,
+          contentType: contentType || null,
+          sourceUrl: candidate
+        });
+      };
+
+      child.on('response', async response => {
+        try {
+          const contentType = response.headers()['content-type'] || '';
+          capture(response.url(), contentType);
+
+          if (/json|javascript|text/i.test(contentType) && /dashreels|dashtoon/i.test(response.url())) {
+            const body = await response.text().catch(() => '');
+            const urls = body.match(/https?:\\/\\/[^"'\\\\\\s]+/gi) || [];
+            for (const raw of urls) capture(raw.replace(/\\\\/g, ''));
+          }
+        } catch {}
+      });
+
+      child.on('request', request => {
+        try { capture(request.url()); } catch {}
+      });
+
+      try {
+        await child.goto(candidate, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await child.waitForTimeout(Math.max(1500, this.scrollWait));
+
+        await child.locator('video').evaluateAll(videos => {
+          for (const video of videos) {
+            try {
+              video.muted = true;
+              const p = video.play();
+              if (p?.catch) p.catch(() => {});
+            } catch {}
+          }
+        }).catch(() => {});
+
+        await child.waitForTimeout(2200);
+
+        const direct = await child.locator('video').evaluateAll(videos =>
+          videos.map(v => ({
+            mediaUrl: v.currentSrc || v.src || null,
+            thumbnailUrl: v.poster || null
+          })).filter(v => v.mediaUrl)
+        ).catch(() => []);
+
+        for (const media of direct) {
+          capture(media.mediaUrl);
+          this.addItem({
+            sourceUrl: candidate,
+            mediaUrl: media.mediaUrl,
+            thumbnailUrl: media.thumbnailUrl,
+            title: null
+          }, 'dashreels-dom');
+        }
+
+        for (const media of localCandidates.values()) {
+          this.networkCandidates.set(media.url, media);
+          this.addItem({
+            sourceUrl: candidate,
+            mediaUrl: media.url,
+            title: null
+          }, 'dashreels-network', media.type);
+        }
+      } catch {
+        // Keep the feed alive if one public page cannot be opened.
+      } finally {
+        await child.close().catch(() => {});
+      }
+    }
   }
 
   async deepScrapeGoodShort(pageItems) {
