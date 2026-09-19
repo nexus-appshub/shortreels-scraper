@@ -54,7 +54,7 @@ export class ReelSession {
         if (/json|javascript|text/i.test(contentType) && /dashreels|dashtoon/i.test(response.url())) {
           const body = await response.text().catch(() => '');
           if (body) {
-            const urls = body.match(/https?:\/\/[^"'\\\\\\s]+/gi) || [];
+            const urls = body.match(/https?:\/\/[^\s"'\\]+/gi) || [];
             for (const raw of urls) {
               const candidate = raw.replace(/\\/g, '');
               capture(candidate);
