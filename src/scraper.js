@@ -6,13 +6,28 @@ import { mediaType, normalizeUrl, pickBetterMedia, stableId } from './utils.js';
 
 const providers = [goodShortProvider, dashReelsProvider, genericProvider];
 
+let sharedBrowserPromise = null;
+
+async function getSharedBrowser() {
+  if (!sharedBrowserPromise) {
+    sharedBrowserPromise = chromium.launch({ headless: true }).catch(error => {
+      sharedBrowserPromise = null;
+      throw error;
+    });
+  }
+  return sharedBrowserPromise;
+}
+
 export class ReelSession {
-  constructor({ url, headless = true, scrollStep = 1100, scrollWait = 900, maxItems = 500 }) {
+  constructor({ url, headless = true, scrollStep = 1100, scrollWait = 900, maxItems = 500, initialWait = 400, deepPageLimit = 3, deepWait = 1200 }) {
     this.url = url;
     this.headless = headless;
     this.scrollStep = scrollStep;
     this.scrollWait = scrollWait;
     this.maxItems = maxItems;
+    this.initialWait = initialWait;
+    this.deepPageLimit = deepPageLimit;
+    this.deepWait = deepWait;
 
     this.browser = null;
     this.context = null;
@@ -72,7 +87,7 @@ export class ReelSession {
   }
 
   async start() {
-    this.browser = await chromium.launch({ headless: this.headless });
+    this.browser = await getSharedBrowser();
 
     this.context = await this.browser.newContext({
       viewport: { width: 390, height: 844 },
@@ -87,7 +102,7 @@ export class ReelSession {
       timeout: 45000
     });
 
-    await this.page.waitForTimeout(this.scrollWait);
+    await this.page.waitForTimeout(this.initialWait);
 
     const newItems = await this.collect();
     return this.snapshot(50, newItems);
@@ -183,9 +198,11 @@ export class ReelSession {
       }
     }).catch(() => {});
 
-    await this.page.waitForTimeout(Math.max(1800, this.scrollWait));
+    await this.page.waitForTimeout(this.deepWait);
 
-    for (const candidate of candidateUrls.slice(0, 6)) {
+    const candidates = candidateUrls.slice(0, this.deepPageLimit);
+
+    await Promise.all(candidates.map(async candidate => {
       if (this.resolvedPages.has(candidate)) continue;
       this.resolvedPages.add(candidate);
 
@@ -224,7 +241,7 @@ export class ReelSession {
 
       try {
         await child.goto(candidate, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await child.waitForTimeout(Math.max(1500, this.scrollWait));
+        await child.waitForTimeout(this.deepWait);
 
         await child.locator('video').evaluateAll(videos => {
           for (const video of videos) {
@@ -236,7 +253,7 @@ export class ReelSession {
           }
         }).catch(() => {});
 
-        await child.waitForTimeout(2200);
+        await child.waitForTimeout(this.deepWait);
 
         const direct = await child.locator('video').evaluateAll(videos =>
           videos.map(v => ({
@@ -268,7 +285,7 @@ export class ReelSession {
       } finally {
         await child.close().catch(() => {});
       }
-    }
+    }));
   }
 
   async deepScrapeGoodShort(pageItems) {
@@ -537,9 +554,9 @@ export class ReelSession {
   }
 
   async close() {
-    await this.browser?.close().catch(() => {});
-    this.browser = null;
+    await this.context?.close().catch(() => {});
     this.context = null;
     this.page = null;
+    this.browser = null;
   }
 }
