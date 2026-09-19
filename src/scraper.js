@@ -203,7 +203,7 @@ export class ReelSession {
     const candidates = candidateUrls.slice(0, this.deepPageLimit);
 
     await Promise.all(candidates.map(async candidate => {
-      if (this.resolvedPages.has(candidate)) continue;
+      if (this.resolvedPages.has(candidate)) return;
       this.resolvedPages.add(candidate);
 
       const child = await this.context.newPage();
