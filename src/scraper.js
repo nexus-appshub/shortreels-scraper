@@ -549,49 +549,51 @@ export class ReelSession {
       newItems = newItems.concat(deepBatch);
     }
 
-    const hasMore = newItems.length > 0 || attemptsWithoutProgress < 3 || lastHeight > 0;
+    const hasMore = newItems.length > 0 || attemptsWithoutProgress < 3;
     return this.snapshot(50, newItems, hasMore);
   }
 
   async listEpisodes(sourceUrl) {
     if (!this.page) await this.start();
 
-    if (sourceUrl) {
-      const target = normalizeUrl(sourceUrl, this.url);
-      if (target && this.page.url() !== target) {
-        await this.page.goto(target, {
-          waitUntil: 'domcontentloaded',
-          timeout: 45000
-        });
-        await this.page.waitForTimeout(Math.max(1000, this.scrollWait));
-      }
-    }
+    const target = normalizeUrl(sourceUrl, this.url) || this.url;
+    const child = await this.context.newPage();
 
-    const numbers = await this.page.evaluate(() => {
-      const set = new Set();
-
-      const add = value => {
-        const n = Number(String(value || '').trim());
-        if (Number.isInteger(n) && n >= 1 && n <= 500) set.add(n);
-      };
-
-      document.querySelectorAll('button, [role="button"], a').forEach(node => {
-        const text = (node.textContent || '').trim();
-        if (/^\d{1,3}$/.test(text)) add(text);
+    try {
+      await child.goto(target, {
+        waitUntil: 'domcontentloaded',
+        timeout: 45000
       });
+      await child.waitForTimeout(Math.max(1000, this.scrollWait));
 
-      const body = document.body?.innerText || '';
-      const range = body.match(/Episodes?\s+(\d+)\s*[–-]\s*(\d+)/i);
-      if (range) {
-        const first = Number(range[1]);
-        const last = Number(range[2]);
-        for (let n = first; n <= Math.min(last, 500); n++) set.add(n);
-      }
+      const numbers = await child.evaluate(() => {
+        const set = new Set();
 
-      return Array.from(set).sort((a, b) => a - b);
-    }).catch(() => []);
+        const add = value => {
+          const n = Number(String(value || '').trim());
+          if (Number.isInteger(n) && n >= 1 && n <= 500) set.add(n);
+        };
 
-    return numbers;
+        document.querySelectorAll('button, [role="button"], a').forEach(node => {
+          const text = (node.textContent || '').trim();
+          if (/^\d{1,3}$/.test(text)) add(text);
+        });
+
+        const body = document.body?.innerText || '';
+        const range = body.match(/Episodes?\s+(\d+)\s*[–-]\s*(\d+)/i);
+        if (range) {
+          const first = Number(range[1]);
+          const last = Number(range[2]);
+          for (let n = first; n <= Math.min(last, 500); n++) set.add(n);
+        }
+
+        return Array.from(set).sort((a, b) => a - b);
+      }).catch(() => []);
+
+      return numbers;
+    } finally {
+      await child.close().catch(() => {});
+    }
   }
 
   async switchEpisode(sourceUrl, episode) {
@@ -601,83 +603,132 @@ export class ReelSession {
       throw new Error('invalid episode');
     }
 
-    const target = normalizeUrl(sourceUrl, this.url);
-    if (target && this.page.url() !== target) {
-      await this.page.goto(target, {
+    const target = normalizeUrl(sourceUrl, this.url) || this.url;
+    const child = await this.context.newPage();
+    const localCandidates = new Map();
+
+    const capture = (url, contentType = '') => {
+      const type = mediaType(url, contentType);
+      if (!type || type === 'segment') return;
+
+      const normalized = normalizeUrl(url, target);
+      if (!normalized) return;
+
+      localCandidates.set(normalized, {
+        url: normalized,
+        type,
+        contentType: contentType || null,
+        sourceUrl: target
+      });
+    };
+
+    child.on('response', async response => {
+      try {
+        const contentType = response.headers()['content-type'] || '';
+        capture(response.url(), contentType);
+
+        if (/json|javascript|text/i.test(contentType) &&
+            /dashreels|dashtoon|goodshort/i.test(response.url())) {
+          const body = await response.text().catch(() => '');
+          if (body) {
+            const urls = body.match(/https?:\/\/[^\s"'\\<>]+/gi) || [];
+            for (const raw of urls) capture(raw.replace(/\\/g, ''));
+          }
+        }
+      } catch {}
+    });
+
+    child.on('request', request => {
+      try {
+        capture(request.url());
+      } catch {}
+    });
+
+    try {
+      await child.goto(target, {
         waitUntil: 'domcontentloaded',
         timeout: 45000
       });
-      await this.page.waitForTimeout(Math.max(1000, this.scrollWait));
-    }
+      await child.waitForTimeout(Math.max(1200, this.scrollWait));
 
-    const beforeCandidates = new Set(this.networkCandidates.keys());
-    const clicked = await this.page.evaluate(n => {
-      const nodes = Array.from(document.querySelectorAll('button, [role="button"], a'));
-      const target = nodes.find(node => {
-        const text = (node.textContent || '').trim();
-        return text === String(n);
-      });
-      if (!target) return false;
-      try {
-        target.scrollIntoView({ block: 'center' });
-        target.click();
-        return true;
-      } catch {
-        return false;
+      const clicked = await child.evaluate(n => {
+        const nodes = Array.from(document.querySelectorAll('button, [role="button"], a'));
+        const targetNode = nodes.find(node => {
+          const text = (node.textContent || '').trim();
+          return text === String(n);
+        });
+        if (!targetNode) return false;
+
+        try {
+          targetNode.scrollIntoView({ block: 'center' });
+          targetNode.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          targetNode.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          targetNode.click();
+          return true;
+        } catch {
+          return false;
+        }
+      }, episode);
+
+      if (!clicked) throw new Error('episode button not found');
+
+      await child.waitForTimeout(Math.max(2600, this.scrollWait + 1200));
+
+      await child.locator('video').evaluateAll(videos => {
+        for (const video of videos) {
+          try {
+            video.muted = true;
+            const p = video.play();
+            if (p?.catch) p.catch(() => {});
+          } catch {}
+        }
+      }).catch(() => {});
+
+      await child.waitForTimeout(1200);
+
+      const direct = await child.locator('video').evaluateAll(videos =>
+        videos.map(v => ({
+          mediaUrl: v.currentSrc || v.src || null,
+          thumbnailUrl: v.poster || null
+        })).filter(v => v.mediaUrl)
+      ).catch(() => []);
+
+      for (const media of direct) {
+        capture(media.mediaUrl);
       }
-    }, episode);
 
-    if (!clicked) throw new Error('episode button not found');
+      const playable = Array.from(localCandidates.values())
+        .filter(x => ['hls', 'dash', 'mp4', 'webm'].includes(x.type));
 
-    await this.page.waitForTimeout(Math.max(2200, this.scrollWait + 1000));
+      const best = playable[playable.length - 1] || direct.find(x => x.mediaUrl);
+      if (!best) {
+        throw new Error('episode is not currently playable through the normal public web player');
+      }
 
-    const direct = await this.page.locator('video').evaluateAll(videos =>
-      videos.map(v => ({
-        mediaUrl: v.currentSrc || v.src || null,
-        thumbnailUrl: v.poster || null
-      })).filter(v => v.mediaUrl)
-    ).catch(() => []);
+      const mediaUrl = best.url || best.mediaUrl;
+      const type = best.type || mediaType(mediaUrl);
 
-    for (const media of direct) {
-      this.addItem({
-        sourceUrl: this.page.url(),
-        mediaUrl: media.mediaUrl,
-        thumbnailUrl: media.thumbnailUrl,
-        title: null,
-        providerId: this.page.url() + '#episode-' + episode
-      }, 'episode-dom');
+      const title = await child.locator('h1').first().textContent().catch(() => null);
+
+      const item = {
+        id: stableId([target, String(episode), mediaUrl]),
+        sourceUrl: target,
+        mediaUrl,
+        type,
+        title: title?.trim() || null,
+        episode,
+        thumbnailUrl: best.thumbnailUrl ? normalizeUrl(best.thumbnailUrl, target) : null,
+        quality: type === 'hls' || type === 'dash' ? 'auto' : null
+      };
+
+      // Keep the selected episode in the session cache as well, without
+      // disturbing the main feed page used for infinite scrolling.
+      this.addItem(item, 'episode-switch', type);
+
+      return item;
+    } finally {
+      await child.close().catch(() => {});
     }
-
-    const fresh = Array.from(this.networkCandidates.values())
-      .filter(candidate => !beforeCandidates.has(candidate.url));
-
-    for (const candidate of fresh) {
-      this.addItem({
-        sourceUrl: this.page.url(),
-        mediaUrl: candidate.url,
-        title: null,
-        providerId: this.page.url() + '#episode-' + episode
-      }, 'episode-network', candidate.type);
-    }
-
-    const title = await this.page.locator('h1').first().textContent().catch(() => null);
-    const best = fresh.find(x => x.type === 'hls' || x.type === 'dash' || x.type === 'mp4' || x.type === 'webm')
-      || direct.find(x => x.mediaUrl);
-
-    if (!best) {
-      throw new Error('episode is not currently playable through the normal public web player');
-    }
-
-    const mediaUrl = best.url || best.mediaUrl;
-    return {
-      id: stableId([this.page.url(), String(episode), mediaUrl]),
-      sourceUrl: this.page.url(),
-      mediaUrl,
-      type: mediaType(mediaUrl),
-      title: title?.trim() || null,
-      episode,
-      quality: mediaType(mediaUrl) === 'hls' || mediaType(mediaUrl) === 'dash' ? 'auto' : null
-    };
   }
 
   snapshot(limit = 50, newItems = [], hasMore = true) {
