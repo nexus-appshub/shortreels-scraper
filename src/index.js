@@ -24,9 +24,14 @@ const DEMO_SOURCES = [
     feedUrl: '/v1/feed?url=https%3A%2F%2Fwww.goodshort.com%2Fdramas%2Fplaylets%3FopenCategory%3D1&limit=10'
   },
   {
-    name: 'DashReels',
-    url: 'https://dashreels.com/',
-    feedUrl: '/v1/feed?url=https%3A%2F%2Fdashreels.com%2F&limit=10'
+    name: 'ReelShort',
+    url: 'https://www.reelshort.com/',
+    feedUrl: '/v1/feed?url=https%3A%2F%2Fwww.reelshort.com%2F&limit=10'
+  },
+  {
+    name: 'FlexTV',
+    url: 'https://www.flextv.cc/',
+    feedUrl: '/v1/feed?url=https%3A%2F%2Fwww.flextv.cc%2F&limit=10'
   }
 ];
 
