@@ -182,7 +182,7 @@ export class ReelSession {
 
     await this.page.waitForTimeout(Math.max(1800, this.scrollWait));
 
-    for (const candidate of candidateUrls.slice(0, 6)) {
+    for (const candidate of candidateUrls.slice(0, 20)) {
       if (this.resolvedPages.has(candidate)) continue;
       this.resolvedPages.add(candidate);
 
@@ -542,9 +542,11 @@ export class ReelSession {
       if (attemptsWithoutProgress >= 3 && afterHeight <= beforeHeight) break;
     }
 
-    // Some SPA pages expose the next batch only after their visible feed has
-    // been warmed up. Do one bounded deep pass before declaring no progress.
-    if (!newItems.length && attemptsWithoutProgress >= 2) {
+    // The SPA can reveal more show/episode links after scrolling. Run one
+    // bounded deep pass whenever this advance did not collect a full batch;
+    // already-resolved pages are skipped, so this only resolves newly seen
+    // public links.
+    if (newItems.length < 10) {
       const deepBatch = await this.collect(true);
       newItems = newItems.concat(deepBatch);
     }
