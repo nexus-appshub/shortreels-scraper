@@ -2,9 +2,10 @@ import { chromium } from 'playwright';
 import { dashReelsProvider } from './providers/dashreels.js';
 import { goodShortProvider } from './providers/goodshort.js';
 import { genericProvider } from './providers/generic.js';
+import { reelShortProvider, flexTvProvider } from './providers/public-short.js';
 import { mediaType, normalizeUrl, pickBetterMedia, stableId } from './utils.js';
 
-const providers = [goodShortProvider, dashReelsProvider, genericProvider];
+const providers = [goodShortProvider, dashReelsProvider, reelShortProvider, flexTvProvider, genericProvider];
 
 export class ReelSession {
   constructor({ url, headless = true, scrollStep = 1100, scrollWait = 900, maxItems = 500 }) {
@@ -115,6 +116,10 @@ export class ReelSession {
       await this.deepScrapeDashReels(pageItems);
     }
 
+    if (deep && (this.provider === 'reelshort' || this.provider === 'flextv')) {
+      await this.deepScrapePublicShort(pageItems);
+    }
+
     for (const candidate of this.networkCandidates.values()) {
       this.addItem(
         {
@@ -128,6 +133,140 @@ export class ReelSession {
     }
 
     return Array.from(this.items.values()).filter(item => !before.has(item.id));
+  }
+
+  async deepScrapePublicShort(pageItems) {
+    const candidateUrls = [];
+    const seen = new Set();
+
+    const addUrl = value => {
+      if (!value) return;
+      try {
+        const u = new URL(value, this.page.url());
+        const allowed =
+          this.provider === 'reelshort'
+            ? /(^|\.)reelshort\.com$/i.test(u.hostname)
+            : /(^|\.)flextv\.cc$/i.test(u.hostname);
+
+        if (!allowed) return;
+        if (!/(movie|episode|episodes|watch|drama|dramas|reel)/i.test(u.pathname)) return;
+
+        const href = u.href;
+        if (seen.has(href)) return;
+        seen.add(href);
+        candidateUrls.push(href);
+      } catch {}
+    };
+
+    for (const item of pageItems) addUrl(item.sourceUrl);
+
+    const domLinks = await this.page.evaluate(() =>
+      Array.from(document.querySelectorAll('a[href]'))
+        .map(a => a.href)
+        .filter(Boolean)
+        .slice(0, 300)
+    ).catch(() => []);
+
+    domLinks.forEach(addUrl);
+
+    await this.page.locator('video').evaluateAll(videos => {
+      for (const video of videos) {
+        try {
+          video.muted = true;
+          const p = video.play();
+          if (p?.catch) p.catch(() => {});
+        } catch {}
+      }
+    }).catch(() => {});
+
+    await this.page.waitForTimeout(Math.max(1800, this.scrollWait));
+
+    for (const candidate of candidateUrls.slice(0, 12)) {
+      if (this.resolvedPages.has(candidate)) continue;
+      this.resolvedPages.add(candidate);
+
+      const child = await this.context.newPage();
+      const localCandidates = new Map();
+
+      const capture = (url, contentType = '') => {
+        const type = mediaType(url, contentType);
+        if (!type || type === 'segment') return;
+
+        const normalized = normalizeUrl(url, candidate);
+        if (!normalized) return;
+
+        localCandidates.set(normalized, {
+          url: normalized,
+          type,
+          contentType: contentType || null,
+          sourceUrl: candidate
+        });
+      };
+
+      child.on('response', async response => {
+        try {
+          const contentType = response.headers()['content-type'] || '';
+          capture(response.url(), contentType);
+
+          if (/json|javascript|text/i.test(contentType)) {
+            const body = await response.text().catch(() => '');
+            const urls = body.match(/https?:\/\/[^\s"'\\<>]+/gi) || [];
+            for (const raw of urls) capture(raw.replace(/\\/g, ''));
+          }
+        } catch {}
+      });
+
+      child.on('request', request => {
+        try { capture(request.url()); } catch {}
+      });
+
+      try {
+        await child.goto(candidate, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await child.waitForTimeout(Math.max(1500, this.scrollWait));
+
+        await child.locator('video').evaluateAll(videos => {
+          for (const video of videos) {
+            try {
+              video.muted = true;
+              const p = video.play();
+              if (p?.catch) p.catch(() => {});
+            } catch {}
+          }
+        }).catch(() => {});
+
+        await child.waitForTimeout(2200);
+
+        const direct = await child.locator('video').evaluateAll(videos =>
+          videos.map(v => ({
+            mediaUrl: v.currentSrc || v.src || null,
+            thumbnailUrl: v.poster || null
+          })).filter(v => v.mediaUrl)
+        ).catch(() => []);
+
+        for (const media of direct) {
+          capture(media.mediaUrl);
+          this.addItem({
+            sourceUrl: candidate,
+            mediaUrl: media.mediaUrl,
+            thumbnailUrl: media.thumbnailUrl,
+            title: null
+          }, 'public-short-dom');
+        }
+
+        for (const media of localCandidates.values()) {
+          this.networkCandidates.set(media.url, media);
+          this.addItem({
+            sourceUrl: candidate,
+            mediaUrl: media.url,
+            title: null
+          }, 'public-short-network', media.type);
+        }
+      } catch {
+        // Keep the feed alive when one public page cannot be opened.
+      } finally {
+        await child.close().catch(() => {});
+      }
+    }
   }
 
   async deepScrapeDashReels(pageItems) {
