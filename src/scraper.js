@@ -89,11 +89,11 @@ export class ReelSession {
 
     await this.page.waitForTimeout(this.scrollWait);
 
-    const newItems = await this.collect();
+    const newItems = await this.collect(true);
     return this.snapshot(50, newItems);
   }
 
-  async collect() {
+  async collect(deep = false) {
     this.lastActivity = Date.now();
 
     const before = new Set(this.items.keys());
@@ -105,16 +105,13 @@ export class ReelSession {
       this.addItem(item, 'dom');
     }
 
-    // GoodShort uses listing/drama/episode pages. Follow public page links
-    // and observe the media requests made by the normal web player.
-    if (this.provider === 'goodshort') {
+    // Deep page resolution is expensive. Run it on initial load and only as
+    // a fallback when normal scrolling did not reveal additional items.
+    if (deep && this.provider === 'goodshort') {
       await this.deepScrapeGoodShort(pageItems);
     }
 
-    // DashReels is a SPA: the feed API can contain the video metadata while
-    // the player may not request media until a video is initialized. Trigger
-    // normal browser playback and inspect public show/episode pages.
-    if (this.provider === 'dashreels') {
+    if (deep && this.provider === 'dashreels') {
       await this.deepScrapeDashReels(pageItems);
     }
 
@@ -514,24 +511,183 @@ export class ReelSession {
   async advance() {
     if (!this.page) await this.start();
 
-    await this.page.evaluate(step => {
-      window.scrollBy({ top: step, behavior: 'instant' });
-    }, this.scrollStep);
+    let newItems = [];
+    let attemptsWithoutProgress = 0;
+    let lastHeight = 0;
 
-    await this.page.waitForTimeout(this.scrollWait);
+    // One request advances the browser through several ordinary scroll steps.
+    // This prevents the Android client from receiving an empty page after the
+    // first ten items simply because the site needed more than one scroll.
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const beforeHeight = await this.page.evaluate(() => document.documentElement.scrollHeight).catch(() => 0);
 
-    const newItems = await this.collect();
-    return this.snapshot(50, newItems);
+      await this.page.evaluate(step => {
+        window.scrollBy({ top: step, behavior: 'instant' });
+      }, this.scrollStep);
+
+      await this.page.waitForTimeout(this.scrollWait);
+
+      const batch = await this.collect(false);
+      if (batch.length) {
+        newItems = newItems.concat(batch);
+        attemptsWithoutProgress = 0;
+      } else {
+        attemptsWithoutProgress++;
+      }
+
+      const afterHeight = await this.page.evaluate(() => document.documentElement.scrollHeight).catch(() => beforeHeight);
+      lastHeight = afterHeight;
+
+      if (newItems.length >= 10) break;
+      if (attemptsWithoutProgress >= 3 && afterHeight <= beforeHeight) break;
+    }
+
+    // Some SPA pages expose the next batch only after their visible feed has
+    // been warmed up. Do one bounded deep pass before declaring no progress.
+    if (!newItems.length && attemptsWithoutProgress >= 2) {
+      const deepBatch = await this.collect(true);
+      newItems = newItems.concat(deepBatch);
+    }
+
+    const hasMore = newItems.length > 0 || attemptsWithoutProgress < 3 || lastHeight > 0;
+    return this.snapshot(50, newItems, hasMore);
   }
 
-  snapshot(limit = 50, newItems = []) {
+  async listEpisodes(sourceUrl) {
+    if (!this.page) await this.start();
+
+    if (sourceUrl) {
+      const target = normalizeUrl(sourceUrl, this.url);
+      if (target && this.page.url() !== target) {
+        await this.page.goto(target, {
+          waitUntil: 'domcontentloaded',
+          timeout: 45000
+        });
+        await this.page.waitForTimeout(Math.max(1000, this.scrollWait));
+      }
+    }
+
+    const numbers = await this.page.evaluate(() => {
+      const set = new Set();
+
+      const add = value => {
+        const n = Number(String(value || '').trim());
+        if (Number.isInteger(n) && n >= 1 && n <= 500) set.add(n);
+      };
+
+      document.querySelectorAll('button, [role="button"], a').forEach(node => {
+        const text = (node.textContent || '').trim();
+        if (/^\d{1,3}$/.test(text)) add(text);
+      });
+
+      const body = document.body?.innerText || '';
+      const range = body.match(/Episodes?\s+(\d+)\s*[–-]\s*(\d+)/i);
+      if (range) {
+        const first = Number(range[1]);
+        const last = Number(range[2]);
+        for (let n = first; n <= Math.min(last, 500); n++) set.add(n);
+      }
+
+      return Array.from(set).sort((a, b) => a - b);
+    }).catch(() => []);
+
+    return numbers;
+  }
+
+  async switchEpisode(sourceUrl, episode) {
+    if (!this.page) await this.start();
+
+    if (!Number.isInteger(episode) || episode < 1 || episode > 500) {
+      throw new Error('invalid episode');
+    }
+
+    const target = normalizeUrl(sourceUrl, this.url);
+    if (target && this.page.url() !== target) {
+      await this.page.goto(target, {
+        waitUntil: 'domcontentloaded',
+        timeout: 45000
+      });
+      await this.page.waitForTimeout(Math.max(1000, this.scrollWait));
+    }
+
+    const beforeCandidates = new Set(this.networkCandidates.keys());
+    const clicked = await this.page.evaluate(n => {
+      const nodes = Array.from(document.querySelectorAll('button, [role="button"], a'));
+      const target = nodes.find(node => {
+        const text = (node.textContent || '').trim();
+        return text === String(n);
+      });
+      if (!target) return false;
+      try {
+        target.scrollIntoView({ block: 'center' });
+        target.click();
+        return true;
+      } catch {
+        return false;
+      }
+    }, episode);
+
+    if (!clicked) throw new Error('episode button not found');
+
+    await this.page.waitForTimeout(Math.max(2200, this.scrollWait + 1000));
+
+    const direct = await this.page.locator('video').evaluateAll(videos =>
+      videos.map(v => ({
+        mediaUrl: v.currentSrc || v.src || null,
+        thumbnailUrl: v.poster || null
+      })).filter(v => v.mediaUrl)
+    ).catch(() => []);
+
+    for (const media of direct) {
+      this.addItem({
+        sourceUrl: this.page.url(),
+        mediaUrl: media.mediaUrl,
+        thumbnailUrl: media.thumbnailUrl,
+        title: null,
+        providerId: this.page.url() + '#episode-' + episode
+      }, 'episode-dom');
+    }
+
+    const fresh = Array.from(this.networkCandidates.values())
+      .filter(candidate => !beforeCandidates.has(candidate.url));
+
+    for (const candidate of fresh) {
+      this.addItem({
+        sourceUrl: this.page.url(),
+        mediaUrl: candidate.url,
+        title: null,
+        providerId: this.page.url() + '#episode-' + episode
+      }, 'episode-network', candidate.type);
+    }
+
+    const title = await this.page.locator('h1').first().textContent().catch(() => null);
+    const best = fresh.find(x => x.type === 'hls' || x.type === 'dash' || x.type === 'mp4' || x.type === 'webm')
+      || direct.find(x => x.mediaUrl);
+
+    if (!best) {
+      throw new Error('episode is not currently playable through the normal public web player');
+    }
+
+    const mediaUrl = best.url || best.mediaUrl;
+    return {
+      id: stableId([this.page.url(), String(episode), mediaUrl]),
+      sourceUrl: this.page.url(),
+      mediaUrl,
+      type: mediaType(mediaUrl),
+      title: title?.trim() || null,
+      episode,
+      quality: mediaType(mediaUrl) === 'hls' || mediaType(mediaUrl) === 'dash' ? 'auto' : null
+    };
+  }
+
+  snapshot(limit = 50, newItems = [], hasMore = true) {
     return {
       provider: this.provider,
       items: Array.from(this.items.values()).slice(-limit),
       newItems,
       total: this.items.size,
       revision: this.revision,
-      hasMore: true,
+      hasMore,
       lastActivity: this.lastActivity
     };
   }
