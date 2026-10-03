@@ -62,7 +62,9 @@ app.get('/', async () => ({
     health: '/health',
     feed: '/v1/feed?url=SOURCE_URL&limit=10',
     demoSources: '/demo-sources',
-    resetSessions: 'POST /v1/reset-sessions'
+    resetSessions: 'POST /v1/reset-sessions',
+    episodes: '/v1/episodes?sessionId=SESSION_ID&sourceUrl=SOURCE_URL',
+    episode: '/v1/episode?sessionId=SESSION_ID&sourceUrl=SOURCE_URL&episode=2'
   },
   note: 'Use /demo-sources for verified public source URLs.'
 }));
@@ -93,6 +95,84 @@ app.post('/v1/reset-sessions', async () => {
     success: true,
     closed: ids.length
   };
+});
+
+app.get('/v1/episodes', async (req, reply) => {
+  const { sessionId, sourceUrl } = req.query;
+  if (!sessionId) {
+    return reply.code(400).send({
+      success: false,
+      error: 'sessionId is required'
+    });
+  }
+
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return reply.code(404).send({
+      success: false,
+      error: 'session expired',
+      hint: 'create a new feed session'
+    });
+  }
+
+  try {
+    const episodes = await session.listEpisodes(sourceUrl || session.url);
+    return {
+      success: true,
+      sessionId,
+      sourceUrl: sourceUrl || session.url,
+      episodes
+    };
+  } catch (error) {
+    return reply.code(502).send({
+      success: false,
+      error: 'failed to list episodes',
+      detail: error.message
+    });
+  }
+});
+
+app.get('/v1/episode', async (req, reply) => {
+  const { sessionId, sourceUrl, episode } = req.query;
+  if (!sessionId) {
+    return reply.code(400).send({
+      success: false,
+      error: 'sessionId is required'
+    });
+  }
+
+  const number = Number(episode);
+  if (!Number.isInteger(number) || number < 1 || number > 500) {
+    return reply.code(400).send({
+      success: false,
+      error: 'valid episode number is required'
+    });
+  }
+
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return reply.code(404).send({
+      success: false,
+      error: 'session expired',
+      hint: 'create a new feed session'
+    });
+  }
+
+  try {
+    const item = await session.switchEpisode(sourceUrl || session.url, number);
+    return {
+      success: true,
+      sessionId,
+      item
+    };
+  } catch (error) {
+    return reply.code(409).send({
+      success: false,
+      sessionId,
+      error: 'episode is not playable',
+      detail: error.message
+    });
+  }
 });
 
 app.get('/v1/feed', async (req, reply) => {
