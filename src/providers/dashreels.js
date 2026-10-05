@@ -38,7 +38,7 @@ export const dashReelsProvider = {
 
         out.push({
           sourceUrl,
-          mediaUrl: typeof mediaUrl === 'string' && /^(https?:)?\\/\\//i.test(mediaUrl) ? mediaUrl : null,
+          mediaUrl: typeof mediaUrl === 'string' && /^https?:\/\//i.test(mediaUrl) ? mediaUrl : null,
           title: obj.title || obj.name || obj.showName || obj.show_name || null,
           thumbnailUrl: obj.thumbnailUrl || obj.thumbnail_url || obj.coverUrl || obj.cover_url || obj.poster || null,
           providerId: id || null
