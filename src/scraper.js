@@ -272,8 +272,10 @@ export class ReelSession {
   async deepScrapeDashReels(pageItems) {
     const queue = [];
     const queued = new Set();
+
     const addSeries = value => {
       if (!value) return;
+
       try {
         const u = new URL(value, this.page.url());
         if (!/dashreels|dashtoon/i.test(u.hostname)) return;
@@ -281,6 +283,7 @@ export class ReelSession {
 
         const href = u.href;
         if (queued.has(href) || this.resolvedPages.has(href)) return;
+
         queued.add(href);
         queue.push(href);
       } catch {}
@@ -298,15 +301,16 @@ export class ReelSession {
 
     for (const href of await collectSeriesLinks(this.page)) addSeries(href);
 
-    // Resolve multiple public series. Each series exposes a Watch Now page and
-    // the first three episodes are browser-playable without an account.
-    let processed = 0;
+    // Keep each deep pass bounded so /v1/feed can complete before Render's
+    // reverse proxy timeout. More series are picked up by subsequent scrolls.
+    const batch = queue
+      .filter(url => !this.resolvedPages.has(url))
+      .slice(0, 4);
 
-    while (queue.length && processed < 12 && this.items.size < this.maxItems) {
-      const seriesUrl = queue.shift();
-      if (!seriesUrl || this.resolvedPages.has(seriesUrl)) continue;
+    if (!batch.length) return;
+
+    await Promise.all(batch.map(async seriesUrl => {
       this.resolvedPages.add(seriesUrl);
-      processed++;
 
       const child = await this.context.newPage();
       const seriesCandidates = new Map();
@@ -347,11 +351,9 @@ export class ReelSession {
       try {
         await child.goto(seriesUrl, {
           waitUntil: 'domcontentloaded',
-          timeout: 30000
+          timeout: 25000
         });
-        await child.waitForTimeout(Math.max(1200, this.scrollWait));
-
-        for (const href of await collectSeriesLinks(child)) addSeries(href);
+        await child.waitForTimeout(900);
 
         const reelLinks = await child.evaluate(() =>
           Array.from(document.querySelectorAll('a[href]'))
@@ -362,49 +364,52 @@ export class ReelSession {
         ).catch(() => []);
 
         const reelUrl = [...new Set(reelLinks)][0];
-
-        if (!reelUrl) continue;
+        if (!reelUrl) return;
 
         await child.goto(reelUrl, {
           waitUntil: 'domcontentloaded',
-          timeout: 30000
+          timeout: 25000
         });
-        await child.waitForTimeout(Math.max(1200, this.scrollWait));
+        await child.waitForTimeout(900);
 
-        const episodeButtons = await child.evaluate(() =>
+        const discoveredEpisodes = await child.evaluate(() =>
           Array.from(document.querySelectorAll('button, [role="button"], a'))
-            .map(node => ({
-              text: (node.textContent || '').trim(),
-              tag: node.tagName
-            }))
-            .filter(x => /^(1|2|3)$/.test(x.text))
-            .map(x => Number(x.text))
+            .map(node => (node.textContent || '').trim())
+            .filter(text => /^\d{1,3}$/.test(text))
+            .map(Number)
+            .filter(n => n >= 1 && n <= 3)
         ).catch(() => []);
 
-        const episodes = [...new Set(episodeButtons)].filter(n => n >= 1 && n <= 3);
-        if (!episodes.length) {
-          episodes.push(1);
-        }
+        const episodes = [...new Set(discoveredEpisodes)].sort((a, b) => a - b);
+        const targets = (episodes.length ? episodes : [1]).slice(0, 3);
 
-        for (const episode of episodes) {
+        for (const episode of targets) {
           const before = new Set(seriesCandidates.keys());
 
-          const clicked = await child.evaluate(n => {
-            const nodes = Array.from(document.querySelectorAll('button, [role="button"], a'));
-            const node = nodes.find(x => (x.textContent || '').trim() === String(n));
-            if (!node) return false;
-            try {
-              node.scrollIntoView({ block: 'center' });
-              node.click();
-              return true;
-            } catch {
-              return false;
-            }
-          }, episode).catch(() => false);
+          const clicked = episode === 1
+            ? true
+            : await child.evaluate(n => {
+                const nodes = Array.from(
+                  document.querySelectorAll('button, [role="button"], a')
+                );
+                const node = nodes.find(
+                  x => (x.textContent || '').trim() === String(n)
+                );
 
-          if (!clicked && episode !== 1) continue;
+                if (!node) return false;
 
-          await child.waitForTimeout(Math.max(2200, this.scrollWait + 500));
+                try {
+                  node.scrollIntoView({ block: 'center' });
+                  node.click();
+                  return true;
+                } catch {
+                  return false;
+                }
+              }, episode).catch(() => false);
+
+          if (!clicked) continue;
+
+          await child.waitForTimeout(1800);
 
           await child.locator('video').evaluateAll(videos => {
             for (const video of videos) {
@@ -416,7 +421,7 @@ export class ReelSession {
             }
           }).catch(() => {});
 
-          await child.waitForTimeout(1000);
+          await child.waitForTimeout(700);
 
           const direct = await child.locator('video').evaluateAll(videos =>
             videos.map(v => ({
@@ -427,6 +432,7 @@ export class ReelSession {
 
           for (const media of direct) {
             capture(media.mediaUrl);
+
             const type = mediaType(media.mediaUrl);
             if (type && type !== 'segment') {
               this.addItem({
@@ -441,7 +447,9 @@ export class ReelSession {
 
           const fresh = Array.from(seriesCandidates.values())
             .filter(candidate => !before.has(candidate.url))
-            .filter(candidate => ['hls', 'dash', 'mp4', 'webm'].includes(candidate.type));
+            .filter(candidate =>
+              ['hls', 'dash', 'mp4', 'webm'].includes(candidate.type)
+            );
 
           for (const candidate of fresh) {
             this.networkCandidates.set(candidate.url, {
@@ -458,11 +466,11 @@ export class ReelSession {
           }
         }
       } catch {
-        // One public series can fail without stopping discovery of the rest.
+        // One public series can fail without blocking the other series.
       } finally {
         await child.close().catch(() => {});
       }
-    }
+    }));
   }
 
   async deepScrapeGoodShort(pageItems) {
