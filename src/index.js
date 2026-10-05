@@ -17,6 +17,16 @@ const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || 1100);
 const SCROLL_WAIT_MS = Number(process.env.SCROLL_WAIT_MS || 900);
 const MAX_REELS_PER_SESSION = Number(process.env.MAX_REELS_PER_SESSION || 500);
 
+const DISABLE_AUTO_PING =
+  String(process.env.DISABLE_AUTO_PING || 'false').toLowerCase() === 'true';
+const AUTO_PING_INTERVAL_MS = Math.max(
+  5 * 60 * 1000,
+  Number(process.env.AUTO_PING_INTERVAL_MS || 13 * 60 * 1000)
+);
+const RENDER_EXTERNAL_URL = String(process.env.RENDER_EXTERNAL_URL || '')
+  .trim()
+  .replace(/\/$/, '');
+
 async function cleanupExpiredSessions() {
   const now = Date.now();
 
@@ -117,6 +127,8 @@ app.get('/demo-sources', async (req) => {
 });
 
 app.get('/health', async () => ({
+  status: 'active',
+  timestamp: new Date().toISOString(),
   ok: true,
   service: 'shortreels-scraper',
   sessions: sessions.size
@@ -363,3 +375,61 @@ await app.listen({
   port: PORT,
   host: HOST
 });
+
+async function selfPing() {
+  if (DISABLE_AUTO_PING) return;
+
+  if (!RENDER_EXTERNAL_URL) {
+    app.log.warn('Auto-ping disabled: RENDER_EXTERNAL_URL is not set');
+    return;
+  }
+
+  const target = RENDER_EXTERNAL_URL + '/health';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const response = await fetch(target, {
+      method: 'GET',
+      headers: {
+        'user-agent': 'shortreels-scraper-self-ping/1.0'
+      },
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      app.log.warn(
+        { statusCode: response.status, target },
+        'Auto-ping returned non-2xx'
+      );
+      return;
+    }
+
+    app.log.info({ target }, 'Auto-ping successful');
+  } catch (error) {
+    app.log.warn(
+      { target, error: error?.message || String(error) },
+      'Auto-ping failed (service remains running)'
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+if (!DISABLE_AUTO_PING) {
+  app.log.info(
+    {
+      intervalMinutes: AUTO_PING_INTERVAL_MS / 60000,
+      target: RENDER_EXTERNAL_URL ? RENDER_EXTERNAL_URL + '/health' : null
+    },
+    'Auto-ping worker configured'
+  );
+
+  setTimeout(() => {
+    selfPing().catch(() => {});
+  }, 15000).unref();
+
+  setInterval(() => {
+    selfPing().catch(() => {});
+  }, AUTO_PING_INTERVAL_MS).unref();
+}
