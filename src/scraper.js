@@ -278,7 +278,8 @@ export class ReelSession {
       try {
         const u = new URL(value, this.page.url());
         if (!/dashreels|dashtoon/i.test(u.hostname)) return;
-        if (!/(show|reel|episode|drama|watch|video)/i.test(u.pathname)) return;
+        if (!/(show|series|reel|episode|drama|watch|video)/i.test(u.pathname)) return;
+
         const href = u.href;
         if (seen.has(href)) return;
         seen.add(href);
@@ -292,52 +293,35 @@ export class ReelSession {
       Array.from(document.querySelectorAll('a[href]'))
         .map(a => a.href)
         .filter(Boolean)
-        .slice(0, 200)
     ).catch(() => []);
 
     domLinks.forEach(addUrl);
 
-    // Initialize any visible HTML5 video elements without bypassing login,
-    // subscription, DRM, CAPTCHA, or other access controls.
-    await this.page.locator('video').evaluateAll(videos => {
-      for (const video of videos) {
-        try {
-          video.muted = true;
-          const p = video.play();
-          if (p?.catch) p.catch(() => {});
-        } catch {}
-      }
-    }).catch(() => {});
+    // The current DashReels homepage exposes show cards as /series/... links.
+    // Resolve those public series pages to their public Watch Now (/reel/...)
+    // page before collecting media requests.
+    await this.page.waitForTimeout(Math.max(1200, this.scrollWait));
 
-    // Some players use a visible play button before the media request starts.
-    await this.page.locator('button, [role="button"]').evaluateAll(nodes => {
-      for (const node of nodes.slice(0, 30)) {
-        const label = (node.getAttribute('aria-label') || node.textContent || '').trim();
-        if (/^(play|watch|continue)$/i.test(label)) {
-          try { node.click(); } catch {}
-        }
-      }
-    }).catch(() => {});
-
-    await this.page.waitForTimeout(Math.max(1800, this.scrollWait));
-
-    for (const candidate of candidateUrls.slice(0, 20)) {
+    for (const candidate of candidateUrls.slice(0, 24)) {
       if (this.resolvedPages.has(candidate)) continue;
       this.resolvedPages.add(candidate);
 
       const child = await this.context.newPage();
       const localCandidates = new Map();
+      let activeSource = candidate;
 
       const capture = (url, contentType = '') => {
         const type = mediaType(url, contentType);
         if (!type || type === 'segment') return;
-        const normalized = normalizeUrl(url, candidate);
+
+        const normalized = normalizeUrl(url, activeSource);
         if (!normalized) return;
+
         localCandidates.set(normalized, {
           url: normalized,
           type,
           contentType: contentType || null,
-          sourceUrl: candidate
+          sourceUrl: activeSource
         });
       };
 
@@ -346,9 +330,10 @@ export class ReelSession {
           const contentType = response.headers()['content-type'] || '';
           capture(response.url(), contentType);
 
-          if (/json|javascript|text/i.test(contentType) && /dashreels|dashtoon/i.test(response.url())) {
+          if (/json|javascript|text/i.test(contentType) &&
+              /dashreels|dashtoon/i.test(response.url())) {
             const body = await response.text().catch(() => '');
-            const urls = body.match(/https?:\/\/[^"'\\\\\\s]+/gi) || [];
+            const urls = body.match(/https?:\/\/[^\s"'\\<>]+/gi) || [];
             for (const raw of urls) capture(raw.replace(/\\/g, ''));
           }
         } catch {}
@@ -359,9 +344,39 @@ export class ReelSession {
       });
 
       try {
-        await child.goto(candidate, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await child.waitForTimeout(Math.max(1500, this.scrollWait));
+        await child.goto(candidate, {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
+        });
+        await child.waitForTimeout(Math.max(1400, this.scrollWait));
 
+        let playablePage = false;
+
+        const path = new URL(candidate).pathname;
+        if (/\/series\//i.test(path)) {
+          const reelLinks = await child.evaluate(() =>
+            Array.from(document.querySelectorAll('a[href]'))
+              .map(a => a.href)
+              .filter(href => /dashreels|dashtoon/i.test(new URL(href).hostname))
+              .filter(href => /\/(reel|episode|watch|video)\//i.test(new URL(href).pathname))
+          ).catch(() => []);
+
+          const reel = [...new Set(reelLinks)][0];
+          if (reel) {
+            activeSource = reel;
+            await child.goto(reel, {
+              waitUntil: 'domcontentloaded',
+              timeout: 30000
+            });
+            await child.waitForTimeout(Math.max(1400, this.scrollWait));
+            playablePage = true;
+          }
+        } else {
+          playablePage = true;
+        }
+
+        // Trigger only the site's normal public player. This does not bypass
+        // authentication, premium restrictions, DRM, or CAPTCHA.
         await child.locator('video').evaluateAll(videos => {
           for (const video of videos) {
             try {
@@ -372,7 +387,16 @@ export class ReelSession {
           }
         }).catch(() => {});
 
-        await child.waitForTimeout(2200);
+        await child.locator('button, [role="button"]').evaluateAll(nodes => {
+          for (const node of nodes.slice(0, 40)) {
+            const label = (node.getAttribute('aria-label') || node.textContent || '').trim();
+            if (/^(play|watch|continue)$/i.test(label)) {
+              try { node.click(); } catch {}
+            }
+          }
+        }).catch(() => {});
+
+        await child.waitForTimeout(2500);
 
         const direct = await child.locator('video').evaluateAll(videos =>
           videos.map(v => ({
@@ -384,7 +408,7 @@ export class ReelSession {
         for (const media of direct) {
           capture(media.mediaUrl);
           this.addItem({
-            sourceUrl: candidate,
+            sourceUrl: activeSource,
             mediaUrl: media.mediaUrl,
             thumbnailUrl: media.thumbnailUrl,
             title: null
@@ -392,18 +416,27 @@ export class ReelSession {
         }
 
         for (const media of localCandidates.values()) {
-          this.networkCandidates.set(media.url, media);
+          this.networkCandidates.set(media.url, {
+            ...media,
+            sourceUrl: activeSource
+          });
           this.addItem({
-            sourceUrl: candidate,
+            sourceUrl: activeSource,
             mediaUrl: media.url,
             title: null
           }, 'dashreels-network', media.type);
         }
+
+        // A page is considered useful when it exposed at least one supported
+        // media URL. Keep searching across more public series when it did not.
+        void playablePage;
       } catch {
-        // Keep the feed alive if one public page cannot be opened.
+        // Keep the feed alive if one public series/reel page cannot be opened.
       } finally {
         await child.close().catch(() => {});
       }
+
+      if (this.items.size >= this.maxItems) break;
     }
   }
 
