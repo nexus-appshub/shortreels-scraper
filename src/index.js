@@ -189,6 +189,10 @@ app.get('/v1/feed', async (req, reply) => {
   const { url, sessionId, limit = 10, newSession } = req.query;
   const safe = safeLimit(limit);
 
+  // Remove expired sessions before deciding whether a source session can be
+  // reused. This prevents an expired/empty session from being resurrected.
+  await cleanupExpiredSessions();
+
   // Explicit sessionId always wins: this is the continuous-scroll path.
   let session = sessionId ? sessions.get(sessionId) : null;
 
