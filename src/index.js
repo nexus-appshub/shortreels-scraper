@@ -15,7 +15,32 @@ const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 4);
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 900000);
 const SCROLL_STEP_PX = Number(process.env.SCROLL_STEP_PX || 1100);
 const SCROLL_WAIT_MS = Number(process.env.SCROLL_WAIT_MS || 900);
-const MAX_REELS_PER_SESSION = Number(process.env.MAX_REELS_PER_SESSION || 500);\n\nasync function cleanupExpiredSessions() {\n  const now = Date.now();\n  for (const [id, session] of sessions) {\n    if (now - session.lastActivity > SESSION_TTL_MS) await destroySession(id);\n  }\n}
+const MAX_REELS_PER_SESSION = Number(process.env.MAX_REELS_PER_SESSION || 500);
+
+async function cleanupExpiredSessions() {
+  const now = Date.now();
+
+  for (const [id, session] of sessions) {
+    if (now - session.lastActivity > SESSION_TTL_MS) {
+      await destroySession(id);
+    }
+  }
+}
+
+async function cleanupDeadSessions() {
+  const now = Date.now();
+
+  for (const [id, session] of sessions) {
+    const isDead =
+      !session.startPromise &&
+      session.revision === 0 &&
+      now - session.startedAt > 120000;
+
+    if (isDead) {
+      await destroySession(id);
+    }
+  }
+}
 
 const DEMO_SOURCES = [
   {
@@ -268,11 +293,14 @@ app.get('/v1/feed', async (req, reply) => {
     }
   }
 
-  await cleanupExpiredSessions();\n\n  if (sessions.size >= MAX_SESSIONS) {
+  await cleanupExpiredSessions();
+  await cleanupDeadSessions();
+
+  if (sessions.size >= MAX_SESSIONS) {
     return reply.code(429).send({
       success: false,
       error: 'session capacity reached',
-      hint: 'POST /v1/reset-sessions or reuse the returned sessionId'
+      hint: 'reuse the returned sessionId or POST /v1/reset-sessions'
     });
   }
 
