@@ -78,7 +78,7 @@ export const dashReelsProvider = {
         const href = a.href;
         if (!href || !/^https?:/i.test(href)) return;
         if (!/dashreels|dashtoon/i.test(new URL(href).hostname)) return;
-        if (/show|reel|episode|drama|watch|video/i.test(new URL(href).pathname)) {
+        if (/show|series|reel|episode|drama|watch|video/i.test(new URL(href).pathname)) {
           add({ sourceUrl: href, title: a.textContent?.trim() || null });
         }
       });
