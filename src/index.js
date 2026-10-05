@@ -239,12 +239,28 @@ app.get('/v1/feed', async (req, reply) => {
     if (existing) {
       existing.lastActivity = Date.now();
 
-      return {
-        success: true,
-        sessionId: existingId,
-        ...existing.snapshot(safe),
-        reused: true
-      };
+      // Never return an unfinished/empty initial session. Wait for the first
+      // scrape to finish; if it produced no playable items, discard it so the
+      // next request gets a genuinely fresh browser session.
+      if (existing.startPromise) {
+        try {
+          await existing.startPromise;
+        } catch {
+          await destroySession(existingId);
+        }
+      }
+
+      const ready = sessions.get(existingId);
+      if (ready && ready.revision > 0) {
+        return {
+          success: true,
+          sessionId: existingId,
+          ...ready.snapshot(safe),
+          reused: true
+        };
+      }
+
+      if (ready) await destroySession(existingId);
     }
   }
 
@@ -270,7 +286,9 @@ app.get('/v1/feed', async (req, reply) => {
   sourceSessions.set(key, id);
 
   try {
-    const first = await session.start();
+    session.startPromise = session.start();
+    const first = await session.startPromise;
+    session.startPromise = null;
 
     return {
       success: true,
@@ -279,6 +297,7 @@ app.get('/v1/feed', async (req, reply) => {
       items: first.items.slice(-safe)
     };
   } catch (error) {
+    session.startPromise = null;
     await destroySession(id);
 
     return reply.code(502).send({
