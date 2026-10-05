@@ -270,58 +270,59 @@ export class ReelSession {
   }
 
   async deepScrapeDashReels(pageItems) {
-    const candidateUrls = [];
-    const seen = new Set();
-
-    const addUrl = value => {
+    const queue = [];
+    const queued = new Set();
+    const addSeries = value => {
       if (!value) return;
       try {
         const u = new URL(value, this.page.url());
         if (!/dashreels|dashtoon/i.test(u.hostname)) return;
-        if (!/(show|series|reel|episode|drama|watch|video)/i.test(u.pathname)) return;
+        if (!/\/series\//i.test(u.pathname)) return;
 
         const href = u.href;
-        if (seen.has(href)) return;
-        seen.add(href);
-        candidateUrls.push(href);
+        if (queued.has(href) || this.resolvedPages.has(href)) return;
+        queued.add(href);
+        queue.push(href);
       } catch {}
     };
 
-    for (const item of pageItems) addUrl(item.sourceUrl);
+    for (const item of pageItems) addSeries(item.sourceUrl);
 
-    const domLinks = await this.page.evaluate(() =>
+    const collectSeriesLinks = async page => page.evaluate(() =>
       Array.from(document.querySelectorAll('a[href]'))
         .map(a => a.href)
         .filter(Boolean)
+        .filter(href => /dashreels|dashtoon/i.test(new URL(href).hostname))
+        .filter(href => /\/series\//i.test(new URL(href).pathname))
     ).catch(() => []);
 
-    domLinks.forEach(addUrl);
+    for (const href of await collectSeriesLinks(this.page)) addSeries(href);
 
-    // The current DashReels homepage exposes show cards as /series/... links.
-    // Resolve those public series pages to their public Watch Now (/reel/...)
-    // page before collecting media requests.
-    await this.page.waitForTimeout(Math.max(1200, this.scrollWait));
+    // Resolve multiple public series. Each series exposes a Watch Now page and
+    // the first three episodes are browser-playable without an account.
+    let processed = 0;
 
-    for (const candidate of candidateUrls.slice(0, 24)) {
-      if (this.resolvedPages.has(candidate)) continue;
-      this.resolvedPages.add(candidate);
+    while (queue.length && processed < 12 && this.items.size < this.maxItems) {
+      const seriesUrl = queue.shift();
+      if (!seriesUrl || this.resolvedPages.has(seriesUrl)) continue;
+      this.resolvedPages.add(seriesUrl);
+      processed++;
 
       const child = await this.context.newPage();
-      const localCandidates = new Map();
-      let activeSource = candidate;
+      const seriesCandidates = new Map();
 
       const capture = (url, contentType = '') => {
         const type = mediaType(url, contentType);
         if (!type || type === 'segment') return;
 
-        const normalized = normalizeUrl(url, activeSource);
+        const normalized = normalizeUrl(url, child.url() || seriesUrl);
         if (!normalized) return;
 
-        localCandidates.set(normalized, {
+        seriesCandidates.set(normalized, {
           url: normalized,
           type,
           contentType: contentType || null,
-          sourceUrl: activeSource
+          sourceUrl: child.url() || seriesUrl
         });
       };
 
@@ -344,99 +345,123 @@ export class ReelSession {
       });
 
       try {
-        await child.goto(candidate, {
+        await child.goto(seriesUrl, {
           waitUntil: 'domcontentloaded',
           timeout: 30000
         });
-        await child.waitForTimeout(Math.max(1400, this.scrollWait));
+        await child.waitForTimeout(Math.max(1200, this.scrollWait));
 
-        let playablePage = false;
+        for (const href of await collectSeriesLinks(child)) addSeries(href);
 
-        const path = new URL(candidate).pathname;
-        if (/\/series\//i.test(path)) {
-          const reelLinks = await child.evaluate(() =>
-            Array.from(document.querySelectorAll('a[href]'))
-              .map(a => a.href)
-              .filter(href => /dashreels|dashtoon/i.test(new URL(href).hostname))
-              .filter(href => /\/(reel|episode|watch|video)\//i.test(new URL(href).pathname))
-          ).catch(() => []);
-
-          const reel = [...new Set(reelLinks)][0];
-          if (reel) {
-            activeSource = reel;
-            await child.goto(reel, {
-              waitUntil: 'domcontentloaded',
-              timeout: 30000
-            });
-            await child.waitForTimeout(Math.max(1400, this.scrollWait));
-            playablePage = true;
-          }
-        } else {
-          playablePage = true;
-        }
-
-        // Trigger only the site's normal public player. This does not bypass
-        // authentication, premium restrictions, DRM, or CAPTCHA.
-        await child.locator('video').evaluateAll(videos => {
-          for (const video of videos) {
-            try {
-              video.muted = true;
-              const p = video.play();
-              if (p?.catch) p.catch(() => {});
-            } catch {}
-          }
-        }).catch(() => {});
-
-        await child.locator('button, [role="button"]').evaluateAll(nodes => {
-          for (const node of nodes.slice(0, 40)) {
-            const label = (node.getAttribute('aria-label') || node.textContent || '').trim();
-            if (/^(play|watch|continue)$/i.test(label)) {
-              try { node.click(); } catch {}
-            }
-          }
-        }).catch(() => {});
-
-        await child.waitForTimeout(2500);
-
-        const direct = await child.locator('video').evaluateAll(videos =>
-          videos.map(v => ({
-            mediaUrl: v.currentSrc || v.src || null,
-            thumbnailUrl: v.poster || null
-          })).filter(v => v.mediaUrl)
+        const reelLinks = await child.evaluate(() =>
+          Array.from(document.querySelectorAll('a[href]'))
+            .map(a => a.href)
+            .filter(Boolean)
+            .filter(href => /dashreels|dashtoon/i.test(new URL(href).hostname))
+            .filter(href => /\/(reel|episode|watch|video)\//i.test(new URL(href).pathname))
         ).catch(() => []);
 
-        for (const media of direct) {
-          capture(media.mediaUrl);
-          this.addItem({
-            sourceUrl: activeSource,
-            mediaUrl: media.mediaUrl,
-            thumbnailUrl: media.thumbnailUrl,
-            title: null
-          }, 'dashreels-dom');
+        const reelUrl = [...new Set(reelLinks)][0];
+
+        if (!reelUrl) continue;
+
+        await child.goto(reelUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000
+        });
+        await child.waitForTimeout(Math.max(1200, this.scrollWait));
+
+        const episodeButtons = await child.evaluate(() =>
+          Array.from(document.querySelectorAll('button, [role="button"], a'))
+            .map(node => ({
+              text: (node.textContent || '').trim(),
+              tag: node.tagName
+            }))
+            .filter(x => /^(1|2|3)$/.test(x.text))
+            .map(x => Number(x.text))
+        ).catch(() => []);
+
+        const episodes = [...new Set(episodeButtons)].filter(n => n >= 1 && n <= 3);
+        if (!episodes.length) {
+          episodes.push(1);
         }
 
-        for (const media of localCandidates.values()) {
-          this.networkCandidates.set(media.url, {
-            ...media,
-            sourceUrl: activeSource
-          });
-          this.addItem({
-            sourceUrl: activeSource,
-            mediaUrl: media.url,
-            title: null
-          }, 'dashreels-network', media.type);
-        }
+        for (const episode of episodes) {
+          const before = new Set(seriesCandidates.keys());
 
-        // A page is considered useful when it exposed at least one supported
-        // media URL. Keep searching across more public series when it did not.
-        void playablePage;
+          const clicked = await child.evaluate(n => {
+            const nodes = Array.from(document.querySelectorAll('button, [role="button"], a'));
+            const node = nodes.find(x => (x.textContent || '').trim() === String(n));
+            if (!node) return false;
+            try {
+              node.scrollIntoView({ block: 'center' });
+              node.click();
+              return true;
+            } catch {
+              return false;
+            }
+          }, episode).catch(() => false);
+
+          if (!clicked && episode !== 1) continue;
+
+          await child.waitForTimeout(Math.max(2200, this.scrollWait + 500));
+
+          await child.locator('video').evaluateAll(videos => {
+            for (const video of videos) {
+              try {
+                video.muted = true;
+                const p = video.play();
+                if (p?.catch) p.catch(() => {});
+              } catch {}
+            }
+          }).catch(() => {});
+
+          await child.waitForTimeout(1000);
+
+          const direct = await child.locator('video').evaluateAll(videos =>
+            videos.map(v => ({
+              mediaUrl: v.currentSrc || v.src || null,
+              thumbnailUrl: v.poster || null
+            })).filter(v => v.mediaUrl)
+          ).catch(() => []);
+
+          for (const media of direct) {
+            capture(media.mediaUrl);
+            const type = mediaType(media.mediaUrl);
+            if (type && type !== 'segment') {
+              this.addItem({
+                sourceUrl: reelUrl,
+                mediaUrl: media.mediaUrl,
+                thumbnailUrl: media.thumbnailUrl,
+                title: null,
+                providerId: reelUrl + '#episode-' + episode
+              }, 'dashreels-episode', type);
+            }
+          }
+
+          const fresh = Array.from(seriesCandidates.values())
+            .filter(candidate => !before.has(candidate.url))
+            .filter(candidate => ['hls', 'dash', 'mp4', 'webm'].includes(candidate.type));
+
+          for (const candidate of fresh) {
+            this.networkCandidates.set(candidate.url, {
+              ...candidate,
+              sourceUrl: reelUrl
+            });
+
+            this.addItem({
+              sourceUrl: reelUrl,
+              mediaUrl: candidate.url,
+              title: null,
+              providerId: reelUrl + '#episode-' + episode + '-' + candidate.url
+            }, 'dashreels-network', candidate.type);
+          }
+        }
       } catch {
-        // Keep the feed alive if one public series/reel page cannot be opened.
+        // One public series can fail without stopping discovery of the rest.
       } finally {
         await child.close().catch(() => {});
       }
-
-      if (this.items.size >= this.maxItems) break;
     }
   }
 
